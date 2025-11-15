@@ -397,8 +397,8 @@ function messageIndicatesWantsCall(msg) {
   if (!msg) return false;
   const text = msg.toLowerCase();
 
-  const yesWords = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'sounds good', 'bet', 'that works', 'perfect', 'great'];
-  const callWords = ['call', 'phone', 'chat', 'talk', 'meeting', 'schedule', 'appointment'];
+  const yesWords = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'sounds good', 'bet', 'that works'];
+  const callWords = ['call', 'phone', 'chat', 'talk', 'meeting'];
 
   const hasYes = yesWords.some(w => text.includes(w));
   const hasCall = callWords.some(w => text.includes(w));
@@ -411,53 +411,12 @@ function messageIndicatesWantsCall(msg) {
     text.includes('set up a call') ||
     text.includes('book a call') ||
     text.includes('schedule something') ||
-    text.includes('that time works') ||
-    text.includes('lets do it') ||
-    text.includes("let's do it")
+    text.includes('that time works')
   ) {
     return true;
   }
 
   return false;
-}
-
-// Generate human-readable summary from state
-function generateLeadSummary(state) {
-  const parts = [];
-  
-  if (state.location && state.location !== 'unknown') {
-    parts.push(`looking in ${state.location}`);
-  }
-  
-  if (state.home_type && state.home_type !== 'unknown') {
-    parts.push(`for a ${state.home_type}`);
-  }
-  
-  if (state.bedrooms && state.bedrooms !== 'unknown') {
-    parts.push(`with ${state.bedrooms} bedrooms`);
-  }
-  
-  if (state.budget && state.budget !== 'unknown') {
-    parts.push(`around ${state.budget}`);
-  }
-  
-  if (state.timeline && state.timeline !== 'unknown') {
-    parts.push(`planning to move ${state.timeline}`);
-  }
-  
-  if (state.preapproval && state.preapproval !== 'unknown') {
-    parts.push(`and they are ${state.preapproval}`);
-  }
-  
-  if (state.motivation && state.motivation !== 'unknown') {
-    parts.push(`because ${state.motivation}`);
-  }
-  
-  if (parts.length === 0) {
-    return "We're still learning about what you're looking for.";
-  }
-  
-  return `Based on what you've shared, you're ${parts.join(', ')}.`;
 }
 
 // Generate smart reply with meeting scheduling and no repeated questions
@@ -511,31 +470,24 @@ async function generateSmartReply(phone, latestUserMessage) {
     return value === null || value === '' || value === undefined;
   });
 
-  // 3) Check if they just said yes to scheduling a meeting
-  if (messageIndicatesWantsCall(latestUserMessage)) {
-    return `Okay sounds good! Click this link to schedule the appointment: ${BOOKING_LINK}`;
-  }
-
   let userInstruction;
 
   if (!nextField) {
-    // We already have everything → send summary and ask about scheduling
-    const summary = generateLeadSummary(state);
-    
+    // We already have everything → summarize + move toward booking a call
     userInstruction = `
 The lead just said: "${latestUserMessage}".
 
-You already have all the information needed. Here's the summary:
-${summary}
+You already know this about them (from earlier messages):
+${JSON.stringify(state, null, 2)}
 
 Your job:
-- Send them the summary above
-- Ask if they'd like to schedule a call to discuss options
-- Keep it casual and friendly
-- Do NOT include the booking link yet - wait for them to say yes
+- Briefly acknowledge their last message naturally
+- Summarize what they're looking for in 1 sentence
+- Ask if they'd like to schedule a quick call with the agent to go over options
+- Include this booking link directly in your reply: ${BOOKING_LINK}
+- Make it sound casual and human, not like a form letter
 - Keep it under 3 sentences total
-
-Example: "${summary} Would you like to schedule a call to discuss your options?"
+- Example: "Great! Based on what you've shared, you're looking for [summary]. Would you like to schedule a quick call to discuss options? You can book a time that works for you here: ${BOOKING_LINK}"
 `;
   } else {
     // We still need ONE thing (e.g. timeline, bedrooms, etc.)
@@ -583,14 +535,13 @@ LOGIC RULES:
 4. Ask at most ONE focused question at a time
 5. Your responses must be short, friendly, and natural (1-2 sentences)
 6. NEVER contradict previously gathered information
-7. If ALL 7 fields are filled:
-   - Send them a summary of what they're looking for
-   - Ask if they'd like to schedule a call
-   - DO NOT include the booking link until they say yes to scheduling
-8. If they say yes to scheduling a call, the system will automatically send the booking link
-9. DO NOT mention fields, checklists, JSON, or that you're analyzing their answers
-10. DO NOT ever ask the same question twice
-11. If their latest message is unrelated (e.g. "yes", "okay"), continue with the next missing field
+7. If ALL 7 fields are filled, STOP asking questions and:
+   - Summarize their criteria in 1 sentence
+   - Ask if they'd like to schedule a quick call
+   - Include the booking link: ${BOOKING_LINK}
+8. DO NOT mention fields, checklists, JSON, or that you're analyzing their answers
+9. DO NOT ever ask the same question twice
+10. If their latest message is unrelated (e.g. "yes", "okay"), continue with the next missing field
 `;
 
   const completion = await openai.chat.completions.create({
