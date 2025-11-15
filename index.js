@@ -4,7 +4,6 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const twilio = require('twilio');
-const OpenAI = require('openai');
 
 const app = express();
 
@@ -12,10 +11,6 @@ const app = express();
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 5000;
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
 
 const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -27,70 +22,34 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Global logger so we see every request
-app.use((req, res, next) => {
-  console.log('Incoming request:', req.method, req.url);
-  next();
-});
+// --- SIMPLE QUALIFICATION FLOW ---
 
-console.log('SUPABASE_URL:', SUPABASE_URL);
-console.log('SUPABASE_KEY starts with:', SUPABASE_KEY?.slice(0, 5));
-console.log('TWILIO_WHATSAPP_NUMBER:', process.env.TWILIO_WHATSAPP_NUMBER);
+const QUALIFICATION_QUESTIONS = [
+  { field: 'location', question: 'What area or city are you looking in?' },
+  { field: 'home_type', question: 'What type of home are you looking for? (house, condo, apartment, etc.)' },
+  { field: 'bedrooms', question: 'How many bedrooms do you need?' },
+  { field: 'budget', question: 'What\'s your budget or price range?' },
+  { field: 'timeline', question: 'When are you looking to move?' },
+  { field: 'preapproval', question: 'Are you pre-approved for a mortgage or planning to pay cash?' },
+  { field: 'motivation', question: 'What\'s motivating your move? (new job, bigger space, investment, etc.)' }
+];
 
 // --- HELPERS ---
 
 function normalizePhone(phone) {
-  // keep only digits, e.g. "+1 (714) 642-3276" -> "17146423276"
   if (!phone) return '';
   return phone.replace(/\D/g, '');
 }
 
-// Save a lead row (used by /lead manual route)
-async function saveLeadToSupabase(name, phone, source) {
-  const url = `${SUPABASE_URL}/rest/v1/leads`;
-
-  console.log('Posting to Supabase URL:', url);
-
-  const data = {
-    name,
-    phone,
-    source
-  };
-
-  const headers = {
-    apikey: SUPABASE_KEY,
-    Authorization: `Bearer ${SUPABASE_KEY}`,
-    'Content-Type': 'application/json',
-    Prefer: 'return=minimal'
-  };
-
-  try {
-    const resp = await axios.post(url, data, { headers });
-    console.log('Supabase insert OK, status:', resp.status);
-  } catch (err) {
-    console.log('Supabase error status:', err.response?.status);
-    console.log('Supabase error data:', err.response?.data || err.message);
-    throw err;
-  }
-}
-
-// Upsert lead fields (location, budget, etc.)
-async function updateLeadFromState(phone, state) {
+// Save or update lead in Supabase
+async function saveLeadToSupabase(phone, updates = {}) {
   const norm = normalizePhone(phone);
   const url = `${SUPABASE_URL}/rest/v1/leads?on_conflict=phone`;
 
-  const row = {
-    phone: norm
+  const data = {
+    phone: norm,
+    ...updates
   };
-
-  if (state.location) row.location = state.location;
-  if (state.budget) row.budget = state.budget;
-  if (state.timeline) row.timeline = state.timeline;
-  if (state.home_type) row.home_type = state.home_type;
-  if (state.bedrooms) row.bedrooms = state.bedrooms;
-  if (state.preapproval) row.preapproval = state.preapproval;
-  if (state.motivation) row.motivation = state.motivation;
-  if (state.lead_score) row.lead_score = state.lead_score;
 
   const headers = {
     apikey: SUPABASE_KEY,
@@ -100,21 +59,19 @@ async function updateLeadFromState(phone, state) {
   };
 
   try {
-    console.log('Upserting lead in Supabase for', norm, 'with', row);
-    await axios.post(url, [row], { headers });
-    console.log('✅ Lead upserted in Supabase');
+    await axios.post(url, [data], { headers });
+    console.log('✅ Lead saved/updated:', updates);
   } catch (err) {
-    console.error('❌ Supabase lead upsert error status:', err.response?.status);
-    console.error('❌ Supabase lead upsert error data:', err.response?.data || err.message);
+    console.log('❌ Supabase error:', err.response?.data || err.message);
   }
 }
 
-// Save a message row (lead / ai / agent)
+// Save message to Supabase
 async function saveMessageToSupabase(leadPhone, sender, message) {
   const url = `${SUPABASE_URL}/rest/v1/messages`;
 
   const data = {
-    lead_phone: leadPhone,
+    lead_phone: normalizePhone(leadPhone),
     sender: sender,
     message: message
   };
@@ -127,91 +84,17 @@ async function saveMessageToSupabase(leadPhone, sender, message) {
   };
 
   try {
-    console.log('Attempting to save message:', data);
     await axios.post(url, data, { headers });
-    console.log('✅ Saved message to Supabase');
+    console.log('✅ Message saved:', sender, message.substring(0, 50) + '...');
   } catch (err) {
-    console.log('❌ Supabase message error status:', err.response?.status);
-    console.log('❌ Supabase message error data:', err.response?.data || err.message);
+    console.log('❌ Message save error:', err.response?.data || err.message);
   }
 }
 
-// Count how many fields are filled
-function countKnownFields(state) {
-  const keys = [
-    "location",
-    "budget",
-    "timeline",
-    "home_type",
-    "bedrooms",
-    "preapproval",
-    "motivation"
-  ];
-
-  return keys.filter(k => {
-    const v = state[k];
-    return typeof v === 'string' && v.trim() !== '';
-  }).length;
-}
-
-// Score lead: hot / warm / cold
-async function scoreLeadFromState(state) {
-  const knownCount = countKnownFields(state);
-
-  const systemPrompt = `
-You are scoring a real estate lead for an agent.
-
-You will receive:
-- A JSON object with these fields:
-  location, budget, timeline, home_type, bedrooms, preapproval, motivation
-- A count of how many of the 7 fields are filled.
-
-Your job is to classify the lead as exactly one of:
-- "hot"
-- "warm"
-- "cold"
-
-[...prompt text unchanged for brevity...]
-`;
-
-  const userPrompt = `
-Known fields count: ${knownCount} out of 7.
-
-Lead info as JSON:
-
-${JSON.stringify(state, null, 2)}
-
-Classify this lead now.
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt }
-    ]
-  });
-
-  const raw = completion.choices[0].message.content.trim().toLowerCase();
-  console.log("Raw lead score:", raw);
-
-  if (raw.includes("hot")) return "hot";
-  if (raw.includes("warm")) return "warm";
-  if (raw.includes("cold")) return "cold";
-
-  return "warm";
-}
-
-// Fetch conversation history for a phone (normalized)
-async function getConversationHistory(phone) {
-  // Always normalize to digits
+// Get current lead state
+async function getCurrentLeadState(phone) {
   const norm = normalizePhone(phone);
-  const url =
-    `${SUPABASE_URL}/rest/v1/messages` +
-    `?select=sender,message,created_at,lead_phone` +
-    `&lead_phone=eq.${encodeURIComponent(norm)}` +
-    `&order=created_at.asc`;
+  const url = `${SUPABASE_URL}/rest/v1/leads?phone=eq.${norm}&select=*`;
 
   const headers = {
     apikey: SUPABASE_KEY,
@@ -220,248 +103,196 @@ async function getConversationHistory(phone) {
 
   try {
     const { data } = await axios.get(url, { headers });
-    return data || [];
+    if (data && data.length > 0) {
+      return data[0];
+    }
   } catch (err) {
-    console.error('Error fetching conversation history:', err.response?.data || err.message);
-    return [];
+    console.error('Error fetching lead state:', err);
   }
+
+  // Return default state
+  return {
+    phone: norm,
+    current_question_index: 0,
+    qualification_complete: false,
+    asked_for_meeting: false,
+    meeting_scheduled: false,
+    lead_score: null,
+    location: null,
+    home_type: null,
+    bedrooms: null,
+    budget: null,
+    timeline: null,
+    preapproval: null,
+    motivation: null
+  };
 }
 
-// Extract structured state from full history
-async function extractLeadStateFromHistory(phone) {
-  const history = await getConversationHistory(phone);
+// Score the lead based on responses
+function calculateLeadScore(lead) {
+  const fields = ['location', 'budget', 'timeline', 'home_type', 'bedrooms', 'preapproval', 'motivation'];
+  
+  // Count how many fields have real values (not null/empty/unknown)
+  const filledCount = fields.filter(field => {
+    const value = lead[field];
+    return value && value !== 'unknown' && value.trim() !== '';
+  }).length;
 
-  const convo = history
-    .map(m => `${m.sender === 'ai' ? 'Assistant' : 'Lead'}: ${m.message}`)
-    .join('\n');
+  // Check for urgency in timeline
+  const timeline = lead.timeline ? lead.timeline.toLowerCase() : '';
+  const isUrgent = timeline.includes('asap') || timeline.includes('soon') || 
+                   timeline.includes('immediately') || timeline.includes('next month') ||
+                   timeline.includes('30 day') || timeline.includes('2 week');
 
-  console.log("Full conversation for", phone, "=>", convo);
+  // Check for strong budget indication
+  const hasStrongBudget = lead.budget && !lead.budget.includes('unknown');
 
-  const systemPrompt = `
-[...long extraction prompt unchanged...]
-`;
+  // Scoring logic
+  if (filledCount >= 5 && isUrgent && hasStrongBudget) return 'hot';
+  if (filledCount >= 4) return 'warm';
+  return 'cold';
+}
 
-  const userPrompt = `
-Here is the full conversation, one message per line:
+// Check if user said yes to meeting
+function isPositiveResponse(message) {
+  if (!message) return false;
+  
+  const text = message.toLowerCase().trim();
+  const positiveWords = [
+    'yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 
+    'sounds good', 'perfect', 'great', 'awesome',
+    'bet', 'definitely', 'absolutely', 'lets do it', "let's do it",
+    'schedule', 'call me', 'call', 'meeting'
+  ];
 
-${convo}
+  return positiveWords.some(word => text.includes(word));
+}
 
-Now extract the JSON as described.
-`;
+// Update lead field based on current question and response
+function updateLeadField(lead, currentQuestionIndex, userResponse) {
+  if (currentQuestionIndex >= QUALIFICATION_QUESTIONS.length) return lead;
+  
+  const field = QUALIFICATION_QUESTIONS[currentQuestionIndex].field;
+  const updatedLead = { ...lead };
+  
+  // Handle "I don't know" type responses
+  if (userResponse.toLowerCase().includes('not sure') || 
+      userResponse.toLowerCase().includes('don\'t know') ||
+      userResponse.toLowerCase().includes('unknown') ||
+      userResponse.toLowerCase().includes('idk')) {
+    updatedLead[field] = 'unknown';
+  } else {
+    updatedLead[field] = userResponse;
+  }
+  
+  return updatedLead;
+}
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt }
-    ]
+// Get the next question or move to scheduling
+// Get the next question or move to scheduling - FIXED VERSION
+async function getNextStep(lead, userResponse) {
+  const currentIndex = lead.current_question_index || 0;
+  
+  console.log('🔍 Current state:', {
+    questionIndex: currentIndex,
+    askedForMeeting: lead.asked_for_meeting,
+    meetingScheduled: lead.meeting_scheduled
   });
 
-  let raw = completion.choices[0].message.content.trim();
-  console.log("Raw lead state JSON:", raw);
-
-  try {
-    const parsed = JSON.parse(raw);
-    const state = {
-      location: parsed.location ?? null,
-      budget: parsed.budget ?? null,
-      timeline: parsed.timeline ?? null,
-      home_type: parsed.home_type ?? null,
-      bedrooms: parsed.bedrooms ?? null,
-      preapproval: parsed.preapproval ?? null,
-      motivation: parsed.motivation ?? null
-    };
-    console.log("Parsed lead state for", phone, "=>", state);
-    return state;
-  } catch (e) {
-    console.error("Failed to parse lead state JSON:", raw);
-    return {
-      location: null,
-      budget: null,
-      timeline: null,
-      home_type: null,
-      bedrooms: null,
-      preapproval: null,
-      motivation: null
-    };
+  // If meeting already scheduled, just acknowledge - ADD THIS CHECK FIRST
+  if (lead.meeting_scheduled) {
+    console.log('✅ Meeting already scheduled - sending final message');
+    return { type: 'already_handled', message: 'Thanks for your message! Our team will be in touch shortly.' };
   }
+
+  // If we're still asking qualification questions
+  if (currentIndex < QUALIFICATION_QUESTIONS.length) {
+    // Update the current field with user's response
+    const updatedLead = updateLeadField(lead, currentIndex, userResponse);
+    
+    // Move to next question
+    updatedLead.current_question_index = currentIndex + 1;
+    
+    // If that was the last question, calculate score
+    if (updatedLead.current_question_index === QUALIFICATION_QUESTIONS.length) {
+      updatedLead.qualification_complete = true;
+      updatedLead.lead_score = calculateLeadScore(updatedLead);
+    }
+    
+    await saveLeadToSupabase(lead.phone, updatedLead);
+    
+    // Return next question or move to scheduling
+    if (updatedLead.current_question_index < QUALIFICATION_QUESTIONS.length) {
+      const nextQuestion = QUALIFICATION_QUESTIONS[updatedLead.current_question_index].question;
+      return { type: 'question', message: nextQuestion };
+    } else {
+      // All questions answered - ask about scheduling
+      updatedLead.asked_for_meeting = true;
+      await saveLeadToSupabase(lead.phone, updatedLead);
+      
+      const score = updatedLead.lead_score;
+      return { 
+        type: 'scheduling', 
+        message: `Thanks for the information! Based on what you've shared, you're a ${score} lead. Would you like to schedule a meeting with one of our agents?` 
+      };
+    }
+  }
+  
+  // If we've asked about scheduling and got a response
+  if (lead.asked_for_meeting && !lead.meeting_scheduled) {
+    console.log('🔄 Processing scheduling response:', userResponse);
+    
+    if (isPositiveResponse(userResponse)) {
+      // They said yes to meeting
+      await saveLeadToSupabase(lead.phone, { 
+        meeting_scheduled: true,
+        wants_meeting: true,
+        meeting_notes: userResponse
+      });
+      return { type: 'meeting_confirmed', message: 'Great! An agent will reach out soon to schedule the meeting.' };
+    } else {
+      // They said no or something else
+      await saveLeadToSupabase(lead.phone, { 
+        meeting_scheduled: true,
+        wants_meeting: false 
+      });
+      return { type: 'meeting_declined', message: 'Thank you! We will reach out soon to discuss your options.' };
+    }
+  }
+  
+  // Fallback
+  return { type: 'fallback', message: 'Thanks for your message! Our team will be in touch shortly.' };
 }
 
-// Generate next smart reply
-async function extractLeadStateFromHistory(phone) {
-  const history = await getConversationHistory(phone);
-
-  const convo = history
-    .map(m => `${m.sender === 'ai' ? 'Assistant' : 'Lead'}: ${m.message}`)
-    .join('\n');
-
-  console.log('Full conversation for', phone, '=>', convo);
-
-  const systemPrompt = `
-You extract structured lead qualification info from a conversation between
-a real estate assistant ("Assistant") and a lead ("Lead").
-
-You must return ONLY valid JSON with this exact shape:
-
-{
-  "location": string | null,
-  "budget": string | null,
-  "timeline": string | null,
-  "home_type": string | null,
-  "bedrooms": string | null,
-  "preapproval": string | null,
-  "motivation": string | null
-}
-
-GENERAL RULES:
-- The conversation is a sequence of turns: "Assistant:" and "Lead:".
-- For every Lead message, you may use the immediately preceding Assistant message
-  to understand what question the Lead is answering.
-- If the Lead gives a very short answer (like just "5", "ASAP", "3-4 months", "not sure yet"),
-  treat it as an answer to the LAST question asked by the Assistant.
-- If the same type of info appears multiple times, ALWAYS use the MOST RECENT mention
-  for that field (location, budget, timeline, home_type, bedrooms, preapproval, motivation).
-
-GENERIC "DON'T KNOW" RULE (APPLIES TO ALL FIELDS):
-- If the last Assistant question is clearly about ONE specific field
-  (location, budget, timeline, home_type, bedrooms, preapproval, motivation),
-  and the Lead replies with something like:
-    "don't know yet"
-    "dont know yet"
-    "not sure yet"
-    "no idea"
-    "no clue"
-    "none"
-    "no preference"
-    "haven't decided"
-    "idk"
-  then you MUST set THAT FIELD to the literal string "unknown" (NOT null),
-  and do NOT change other fields.
-
-FIELD RULES:
-
-- LOCATION:
-  - Any city, state, area, or neighborhood (e.g. "Dallas", "Phoenix", "near ASU").
-  - Phrases like "Houses in Tempe", "Somewhere in Dallas", "a place in Maryland"
-    MUST set location to the core place name: "Tempe", "Dallas", "Maryland".
-  - If the last Assistant question is about where they want to live / location / area,
-    and the Lead says a generic "not sure yet" type answer, then location = "unknown".
-
-- BUDGET:
-  - Any price or range for what they want to spend (e.g. "400k", "under 500k", "$2,000/month").
-  - If they give a number or price phrase, use that as budget.
-  - If the last Assistant question is about budget / price / what they want to spend,
-    and they reply with a generic "don't know / none / not sure", then budget = "unknown".
-
-- TIMELINE:
-  - When they want to move (e.g. "next 3 months", "this summer", "ASAP", "3-4 years").
-  - Look for time words: "month(s)", "year(s)", "week(s)", "ASAP", "soon", "later", "this fall", etc.
-  - If the last Assistant question is about when they want to move / timeline / how soon,
-    and they reply with a generic "not sure / no rush / haven't decided", then timeline = "unknown".
-  - IMPORTANT:
-    - If the Lead reply is ONLY a number or numeric range like "3-4" with NO time words,
-      DO NOT treat it as timeline by itself.
-    - Only assign to timeline if time units are explicitly mentioned, like "3-4 months" or "3-4 years".
-
-- HOME TYPE:
-  - Words like "house", "condo", "apartment", "townhouse", "duplex", etc.
-  - If the last Assistant question asks what type of place or property they want,
-    and they respond with "not sure / no preference / don't know", then home_type = "unknown".
-
-- BEDROOMS:
-  - Number of bedrooms (e.g. "3 bedrooms", "2-3 beds", "5 bed", or just "3", "3-4").
-  - If the last Assistant question mentions "bedroom", "bedrooms", "beds", or "rooms",
-    and the Lead replies with:
-      - a single number (e.g. "5"), OR
-      - a numeric range (e.g. "3-4", "2-3"),
-    then that value MUST go to "bedrooms", NOT "timeline" and NOT any other field.
-  - Examples:
-      Assistant: "How many bedrooms are you looking for?"
-      Lead: "5"
-        => bedrooms: "5"
-      Assistant: "How many bedrooms do you need?"
-      Lead: "3-4"
-        => bedrooms: "3-4"
-  - If the last Assistant question is about bedrooms and they say "not sure" etc.,
-    then bedrooms = "unknown".
-
-- PREAPPROVAL:
-  - Any mention of mortgage pre-approval or paying cash 
-    (e.g. "pre-approved", "not pre-approved yet", "paying cash").
-  - If the last Assistant question asks whether they are pre-approved or how they plan to finance,
-    and they respond with "don't know yet / not sure", then preapproval = "unknown".
-
-- MOTIVATION:
-  - Why they are moving (e.g. "new job", "investment property", "bigger place", "going to ASU").
-  - If the last Assistant question is about why they are moving / their reason / motivation,
-    and they respond with "not sure", "no real reason", "just looking", then motivation = "unknown".
-
-If something is not clearly mentioned, use null for that field.
-
-Return ONLY JSON. No extra text.
-`;
-
-  const userPrompt = `
-Here is the full conversation, one message per line:
-
-${convo}
-
-Now extract the JSON as described.
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
-    ]
+// Main conversation handler
+// Main conversation handler - FIXED VERSION
+async function handleConversation(phone, userMessage) {
+  console.log(`\n💬 Processing message from ${phone}: "${userMessage}"`);
+  
+  // Get current lead state - THIS IS CRITICAL
+  let lead = await getCurrentLeadState(phone);
+  console.log('📊 Current lead state:', {
+    questionIndex: lead.current_question_index,
+    complete: lead.qualification_complete,
+    askedForMeeting: lead.asked_for_meeting,
+    meetingScheduled: lead.meeting_scheduled,
+    score: lead.lead_score
   });
-
-  let raw = completion.choices[0].message.content.trim();
-  console.log('Raw lead state JSON:', raw);
-
-  try {
-    const parsed = JSON.parse(raw);
-    const state = {
-      location: parsed.location ?? null,
-      budget: parsed.budget ?? null,
-      timeline: parsed.timeline ?? null,
-      home_type: parsed.home_type ?? null,
-      bedrooms: parsed.bedrooms ?? null,
-      preapproval: parsed.preapproval ?? null,
-      motivation: parsed.motivation ?? null
-    };
-    console.log('Parsed lead state for', phone, '=>', state);
-    return state;
-  } catch (e) {
-    console.error('Failed to parse lead state JSON:', raw);
-    return {
-      location: null,
-      budget: null,
-      timeline: null,
-      home_type: null,
-      bedrooms: null,
-      preapproval: null,
-      motivation: null
-    };
-  }
-}
-
-// Simple placeholder so /lead doesn't crash
-async function generateLeadReply(name, source) {
-  return `Hey ${name}, thanks for reaching out about real estate from ${source || 'your inquiry'}! An agent will follow up with you shortly.`;
+  
+  // Handle the conversation and get next step
+  const nextStep = await getNextStep(lead, userMessage);
+  console.log('🔄 Next step:', nextStep.type, '-', nextStep.message);
+  
+  return nextStep.message;
 }
 
 // --- ROUTES ---
 
-// Health check
 app.get('/', (req, res) => {
   res.send('Real Estate AI Backend is running 🚀');
 });
 
-// Manual lead-creation route (not WhatsApp-based)
+// Manual lead creation
 app.post('/lead', async (req, res) => {
   try {
     const { name, phone, source } = req.body;
@@ -470,197 +301,60 @@ app.post('/lead', async (req, res) => {
       return res.status(400).json({ error: 'name and phone are required' });
     }
 
-    await saveLeadToSupabase(name, phone, source || 'unknown');
-    const aiMessage = await sendLeadText(phone, name, source || 'unknown');
-    await saveMessageToSupabase(normalizePhone(phone), "ai", aiMessage);
+    await saveLeadToSupabase(phone, { name, source: source || 'unknown' });
+    
+    // Start conversation with first question
+    const firstQuestion = QUALIFICATION_QUESTIONS[0].question;
+    await saveMessageToSupabase(phone, "ai", firstQuestion);
 
-    res.json({ status: 'lead saved ✅' });
+    res.json({ status: 'lead saved ✅', first_question: firstQuestion });
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error(err);
     res.status(500).json({ error: 'failed to save lead' });
   }
 });
 
-// Test route to verify messages-table logging
-app.get('/test-log', async (req, res) => {
-  try {
-    await saveMessageToSupabase('TEST_PHONE', 'ai', 'This is a test message');
-    res.send('Test message saved (or at least attempted). Check terminal and Supabase.');
-  } catch (err) {
-    res.status(500).send('Test failed');
-  }
-});
-
-// Twilio WhatsApp webhook
+// WhatsApp webhook
 app.post('/whatsapp-webhook', async (req, res) => {
   try {
-    const from = req.body.From;  // "whatsapp:+1714..."
-    const body = req.body.Body;  // lead's message text
+    const from = req.body.From;
+    const body = req.body.Body;
 
-    console.log('Incoming WhatsApp message:', from, body);
+    console.log(`\n📱 INCOMING WHATSAPP from ${from}: "${body}"`);
 
     const leadPhone = normalizePhone(from);
 
-    // 1) Save incoming lead message
-    const aiReply = await generateSmartReply(leadPhone, body);
+    // Save incoming message
     await saveMessageToSupabase(leadPhone, "lead", body);
 
-    // 2) Generate AI reply
-    async function generateSmartReply(phone, latestUserMessage) {
-  // 1) Understand what info we already have from the whole history
-  const state = await extractLeadStateFromHistory(phone);
-
-  const fieldsInOrder = [
-    'location',
-    'budget',
-    'timeline',
-    'home_type',
-    'bedrooms',
-    'preapproval',
-    'motivation'
-  ];
-
-  const labels = {
-    location: 'the location or area they are looking in',
-    budget: 'their budget or price range',
-    timeline: 'when they want to move',
-    home_type: 'the type of home they want (house, condo, townhouse, etc.)',
-    bedrooms: 'how many bedrooms they want',
-    preapproval: 'whether they are pre-approved or paying cash',
-    motivation: 'why they are moving or buying'
-  };
-
-  // 2) Decide what we still need (first missing field)
-  const nextField = fieldsInOrder.find((field) => {
-    const value = state[field];
-    return value === null || value === '' || value === undefined;
-  });
-
-  let userInstruction;
-
-  if (!nextField) {
-    // We already have everything → summarize + move toward booking a call
-    userInstruction = `
-The lead just said: "${latestUserMessage}".
-
-You already know this about them (from earlier messages):
-${JSON.stringify(state, null, 2)}
-
-Your job:
-- Briefly summarize what they're looking for (location, budget, timeline, home type, bedrooms, preapproval, motivation).
-- Ask if they'd like to schedule a quick call with the agent to go over options or set up a viewing.
-- Keep it under 2 sentences.
-`;
-  } else {
-    // We still need ONE thing (e.g. timeline, bedrooms, etc.)
-    userInstruction = `
-The lead just said: "${latestUserMessage}".
-
-So far you know this about them:
-${JSON.stringify(state, null, 2)}
-
-You STILL need to collect ONLY this missing piece: ${labels[nextField]}.
-
-Your job:
-- DO NOT re-ask about any field that already has a non-empty value in the JSON above.
-- Assume the JSON is the source of truth for what has already been answered.
-- Ask ONE short, natural question that focuses ONLY on ${labels[nextField]}.
-- You can briefly acknowledge what they already told you, but do not ask about those again.
-- Keep your response to 1–2 sentences, casual and friendly.
-- Determine which of the 7 qualification fields is still missing.
-- Ask ONLY about that single missing field.
-- DO NOT ask about anything already filled, regardless of quality.
-- If a missing field is answered vaguely ("idk", "not sure", "don't know"), set that field to "unknown".
-- If no fields are missing, summarize what they want in one sentence and ask if they'd like to schedule a call.
-
-Respond with only the message you would send to the lead.
-`;
-  }
-
-  const systemPrompt = `
-You are a friendly real estate assistant chatting with a lead over WhatsApp.
-
-Rules:
-- Use the JSON "known info" and the instructions to decide what to say.
-- NEVER ask again about anything that already has a value in the JSON (even if the new message repeats it).
-- Ask at most ONE focused question at a time.
-- Be casual and human, not robotic.
-- Keep answers under 2 sentences.
-- Do not mention that you're using JSON, "fields", or a "checklist".
-You are a highly structured real estate qualification assistant.
-
-ABSOLUTE RULES:
-1. You NEVER ask a question about a field that already has a value (including "unknown").
-2. You identify which field is missing and ask ONLY about that one.
-3. You NEVER re-ask or circle back.
-4. Your responses must be short, friendly, and natural (1–2 sentences).
-5. NEVER contradict previously gathered information.
-6. If a lead gives a vague answer ("idk", "I'm not sure", "don't know yet"), treat it as the literal string: "unknown".
-7. If ALL 7 fields are filled, STOP asking questions and move immediately to:
-   - Summarizing their criteria in 1 sentence
-   - Asking if they'd like to schedule a quick call with the agent.
-8. DO NOT mention fields, checklists, JSON, or that you're analyzing their answers.
-9. DO NOT ever ask the same question twice.
-10. If their latest message is unrelated (e.g. "yes", "okay"), continue with the next missing field rather than repeating.
-
-You MUST follow these rules exactly.
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userInstruction }
-    ]
-  });
-
-  return completion.choices[0].message.content.trim();
-}
-
-    // 3) Save AI reply
+    // Generate response
+    const aiReply = await handleConversation(leadPhone, body);
+    
+    // Save AI response
     await saveMessageToSupabase(leadPhone, "ai", aiReply);
 
-    // 4) Re-extract state and update lead + score
-    const state = await extractLeadStateFromHistory(leadPhone);
-    const knownCount = countKnownFields(state);
-
-    if (knownCount === 7) {
-      const leadScore = await scoreLeadFromState(state);
-      state.lead_score = leadScore;
-    } else {
-      state.lead_score = null;
-    }
-
-    await updateLeadFromState(leadPhone, state);
-
-    // 5) Try Twilio send (but don't kill logic if it fails)
+    // Send via Twilio
     try {
       await client.messages.create({
         from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
         to: from,
         body: aiReply
       });
+      console.log('✅ Reply sent via Twilio');
     } catch (twilioErr) {
-      console.error('Twilio send error:', twilioErr.code, twilioErr.message);
-      if (twilioErr.code === 63038) {
-        console.warn('⚠️ Hit Twilio daily message limit. Skipping send but keeping logic.');
-      }
+      console.error('❌ Twilio send error:', twilioErr.message);
     }
 
     res.status(200).send('');
   } catch (err) {
-    console.error('Error in /whatsapp-webhook:', err);
+    console.error('❌ Error in webhook:', err);
     res.status(500).send('');
   }
 });
 
 // Get leads for frontend
 app.get('/leads', async (req, res) => {
-  const url =
-    `${SUPABASE_URL}/rest/v1/leads` +
-    `?select=phone,name,source,location,budget,timeline,home_type,bedrooms,preapproval,motivation,lead_score,notes`;
-
+  const url = `${SUPABASE_URL}/rest/v1/leads?select=*`;
   const headers = {
     apikey: SUPABASE_KEY,
     Authorization: `Bearer ${SUPABASE_KEY}`
@@ -670,77 +364,59 @@ app.get('/leads', async (req, res) => {
     const { data } = await axios.get(url, { headers });
     res.json(data || []);
   } catch (err) {
-    console.error('Error fetching leads from Supabase:', err.response?.data || err.message);
+    console.error('Error fetching leads:', err);
     res.status(500).json({ error: 'failed_to_fetch_leads' });
   }
 });
 
-// Get messages for a lead (for frontend)
+// Get messages for a lead
 app.get('/leads/:phone/messages', async (req, res) => {
-  const phone = req.params.phone; // normalized digits from leads
-
-  const url =
-    `${SUPABASE_URL}/rest/v1/messages` +
-    `?select=sender,message,created_at,lead_phone` +
-    `&lead_phone=eq.${encodeURIComponent(phone)}` +
-    `&order=created_at.asc`;
-
+  const phone = req.params.phone;
+  const url = `${SUPABASE_URL}/rest/v1/messages?lead_phone=eq.${phone}&select=*&order=created_at.asc`;
+  
   const headers = {
     apikey: SUPABASE_KEY,
     Authorization: `Bearer ${SUPABASE_KEY}`
   };
 
-  console.log('Fetching messages for lead:', phone, '->', url);
-
   try {
     const { data } = await axios.get(url, { headers });
-    console.log('Messages from Supabase:', data);
     res.json(data || []);
   } catch (err) {
-    console.error(
-      'Error fetching messages from Supabase:',
-      err.response?.data || err.message
-    );
+    console.error('Error fetching messages:', err);
     res.status(500).json({ error: 'failed_to_fetch_messages' });
   }
 });
 
-// Agent reply from dashboard
+// Agent reply
 app.post('/leads/:phone/reply', async (req, res) => {
-  const phone = req.params.phone;        // e.g. "17146423276"
+  const phone = req.params.phone;
   const { message } = req.body;
 
-  if (!message || !message.trim()) {
+  if (!message?.trim()) {
     return res.status(400).json({ error: 'Message is required' });
   }
 
-  const trimmed = message.trim();
-  const toWhatsApp = `whatsapp:+${phone}`;
-  let twilioError = null;
-
-  console.log('Agent reply endpoint hit for', phone, 'message:', trimmed);
-
-  // 1) Try sending via Twilio, but don't fail hard if it breaks
   try {
-    await client.messages.create({
-      from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-      to: toWhatsApp,
-      body: trimmed
-    });
-  } catch (err) {
-    console.error('Error sending agent reply via Twilio:', err.message);
-    twilioError = err.message;
-  }
+    // Save agent message
+    await saveMessageToSupabase(phone, 'agent', message.trim());
 
-  // 2) Always try to save to Supabase as 'agent' message
-  try {
-    await saveMessageToSupabase(phone, 'agent', trimmed);
-  } catch (err) {
-    console.error('Failed to save agent message to Supabase:', err);
-    return res.status(500).json({ error: 'failed_to_save_message' });
-  }
+    // Try to send via Twilio
+    try {
+      await client.messages.create({
+        from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
+        to: `whatsapp:+${phone}`,
+        body: message.trim()
+      });
+    } catch (twilioErr) {
+      console.error('Twilio send error:', twilioErr.message);
+    }
 
-  return res.json({ success: true, twilioError });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error sending agent reply:', err);
+    res.status(500).json({ error: 'failed_to_send_message' });
+  }
 });
 
 // Update notes
@@ -753,7 +429,6 @@ app.patch('/leads/:phone/notes', async (req, res) => {
   }
 
   const url = `${SUPABASE_URL}/rest/v1/leads?phone=eq.${phone}`;
-
   const headers = {
     apikey: SUPABASE_KEY,
     Authorization: `Bearer ${SUPABASE_KEY}`,
@@ -763,14 +438,15 @@ app.patch('/leads/:phone/notes', async (req, res) => {
 
   try {
     const { data } = await axios.patch(url, { notes }, { headers });
-    return res.json({ success: true, lead: data?.[0] || null });
+    res.json({ success: true, lead: data?.[0] || null });
   } catch (err) {
-    console.error('Error updating lead notes:', err.response?.data || err.message);
-    return res.status(500).json({ error: 'failed_to_update_notes' });
+    console.error('Error updating notes:', err);
+    res.status(500).json({ error: 'failed_to_update_notes' });
   }
 });
 
-// --- START SERVER ---
+// Start server
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Real Estate Bot running on port ${PORT}`);
+  console.log('📝 Qualification questions:', QUALIFICATION_QUESTIONS.length);
 });
